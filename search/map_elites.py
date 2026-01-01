@@ -37,7 +37,15 @@ class MutationConfig:
     motif_prob: float = 0.35
     motif_len_min: int = 3
     motif_len_max: int = 6
+    reverse_prob: float = 0.15
+    tilt_prob: float = 0.20
+    tilt_len_min: int = 4
+    tilt_len_max: int = 10
 
+
+def clamp_to_step_set(v: int, step_set: Tuple[int, ...]) -> int:
+    # wybiera najbliższy do v element z step_set
+    return min(step_set, key=lambda s: abs(s - v))
 
 def mutate_intervals(intervals: List[int], cfg: MutationConfig) -> List[int]:
     out = intervals[:]
@@ -57,8 +65,43 @@ def mutate_intervals(intervals: List[int], cfg: MutationConfig) -> List[int]:
             motif = out[src:src + L]
             out[dst:dst + L] = motif
 
+    # 3) reverse fragment (zmiana dramaturgii bez rozwalania statów)
+    if random.random() < cfg.reverse_prob and len(out) >= 6:
+        L = random.randint(3, min(10, len(out)))
+        i = random.randrange(0, len(out) - L + 1)
+        frag = out[i:i + L]
+        out[i:i + L] = list(reversed(frag))
+
+    # 4) tilt fragmentu: dodaj +1/-1 do sekwencji (z clampem do step_set)
+    if random.random() < cfg.tilt_prob and len(out) >= cfg.tilt_len_min:
+        L = random.randint(cfg.tilt_len_min, min(cfg.tilt_len_max, len(out)))
+        i = random.randrange(0, len(out) - L + 1)
+        sign = random.choice((-1, 1))
+        for j in range(i, i + L):
+            out[j] = clamp_to_step_set(out[j] + sign, cfg.step_set)
+
     return out
 
+def interval_ngrams(intervals: List[int], n: int = 4) -> set[tuple[int, ...]]:
+    if len(intervals) < n:
+        return set()
+    return {tuple(intervals[i:i+n]) for i in range(len(intervals) - n + 1)}
+
+def novelty_against(elite: Elite, others: List[Elite], ngram_n: int = 4) -> float:
+    ints = pitches_to_intervals(elite.melody.pitches)
+    A = interval_ngrams(ints, n=ngram_n)
+    if not others or not A:
+        return 1.0
+    best = 0.0
+    for o in others:
+        B = interval_ngrams(pitches_to_intervals(o.melody.pitches), n=ngram_n)
+        if not B:
+            continue
+        inter = len(A & B)
+        union = len(A | B)
+        sim = inter / union if union else 0.0  # Jaccard similarity
+        best = max(best, sim)
+    return 1.0 - best  # 1 = bardzo inne, 0 = bardzo podobne
 
 # ---------- opis niszy (descriptor) ----------
 
@@ -72,17 +115,18 @@ class DescriptorConfig:
     max_turn_rate: float = 1.0
 
 
-def descriptor_from_stats(stats: MelodyStats, cfg: DescriptorConfig) -> Tuple[int, int]:
-    # ambitus bin
+def descriptor_from_stats(stats: MelodyStats, cfg: DescriptorConfig) -> Tuple[int, int, int]:
     a = min(stats.ambitus, cfg.max_ambitus_bin)
 
-    # turn_rate bin
     denom = max(1, stats.n - 2)
     turn_rate = stats.turns / denom
     turn_rate = max(0.0, min(cfg.max_turn_rate, float(turn_rate)))
     tbin = int(turn_rate / cfg.turn_rate_step + 1e-9)
 
-    return (a, tbin)
+    used_pc = sum(1 for c in stats.pitch_class_hist if c > 0)  # 1..12
+    pcbin = used_pc  # bez koszykowania, już jest 1..12
+
+    return (a, tbin, pcbin)
 
 
 # ---------- MAP-Elites ----------
@@ -91,8 +135,8 @@ def descriptor_from_stats(stats: MelodyStats, cfg: DescriptorConfig) -> Tuple[in
 class MapElitesConfig:
     n_notes: int = 32
     start_pitch: int = 0  # relatywnie; MIDI mapping robisz później w rendererze
-    init_random: int = 3000  # ile losowych prób na start, żeby zasilić archiwum
-    iterations: int = 50000  # ile mutacji / prób zasiedlenia nisz
+    init_random: int = 20000  # ile losowych prób na start, żeby zasilić archiwum
+    iterations: int = 300000  # ile mutacji / prób zasiedlenia nisz
 
     mutation: MutationConfig = MutationConfig()
     descriptor: DescriptorConfig = DescriptorConfig()
@@ -104,7 +148,7 @@ class MapElitesConfig:
     max_elites_to_save: int = 300
 
 
-EliteKey = Tuple[int, int]
+EliteKey = Tuple[int, int, int]
 
 
 @dataclass
@@ -118,11 +162,49 @@ class MapElites:
     def __init__(self, evaluator, cfg: MapElitesConfig):
         self.evaluator = evaluator
         self.cfg = cfg
-        self.archive: Dict[EliteKey, Elite] = {}
+        self.archive: Dict[EliteKey, List[Elite]] = {}
+        self.per_cell: int = 3  # top-3 na niszę
 
     def _random_candidate(self) -> Melody:
-        # losowe interwały z step_set
-        intervals = [random.choice(self.cfg.mutation.step_set) for _ in range(self.cfg.n_notes - 1)]
+        mode = random.random()
+        n_int = self.cfg.n_notes - 1
+
+        # Mode A: stepwise (prawie same małe kroki)
+        if mode < 0.45:
+            small = (-2, -1, 0, 1, 2)
+            big = tuple(d for d in self.cfg.mutation.step_set if abs(d) >= 3)
+            intervals = []
+            for _ in range(n_int):
+                if random.random() < 0.90:
+                    intervals.append(random.choice(small))
+                else:
+                    intervals.append(random.choice(big) if big else random.choice(small))
+
+        # Mode B: arpeggio-ish (częściej tercje/kwarty/kwinty)
+        elif mode < 0.75:
+            arp = (0, 3, -3, 4, -4, 5, -5)
+            spice = tuple(self.cfg.mutation.step_set)
+            intervals = []
+            for _ in range(n_int):
+                if random.random() < 0.85:
+                    intervals.append(random.choice(arp))
+                else:
+                    intervals.append(random.choice(spice))
+
+        # Mode C: phrase arches (4 frazy po 8, łuki)
+        else:
+            intervals = []
+            phrase_len = 8
+            for _phrase in range(max(1, self.cfg.n_notes // phrase_len)):
+                # pół frazy w górę, pół w dół (z szumem)
+                up_len = phrase_len // 2
+                down_len = phrase_len - up_len
+                for _ in range(up_len):
+                    intervals.append(random.choice((1, 1, 2, 0, 2, 1)))
+                for _ in range(down_len):
+                    intervals.append(random.choice((-1, -1, -2, 0, -2, -1)))
+            intervals = intervals[:n_int]
+
         pitches = intervals_to_pitches(self.cfg.start_pitch, intervals)
         return Melody(pitches)
 
@@ -137,16 +219,31 @@ class MapElites:
         return Elite(melody=melody, score=float(res.score), key=key)
 
     def _try_insert(self, elite: Elite) -> bool:
-        cur = self.archive.get(elite.key)
-        if cur is None or elite.score > cur.score:
-            self.archive[elite.key] = elite
+        cell = self.archive.get(elite.key)
+        if cell is None:
+            self.archive[elite.key] = [elite]
             return True
-        return False
+
+        # jeśli już mamy prawie identyczną, nie dodawaj (novelty cutoff)
+        nov = novelty_against(elite, cell, ngram_n=4)
+        if nov < 0.15:
+            return False
+
+        cell.append(elite)
+
+        # sort: najpierw score, ale jak score zbliżone, wolisz bardziej novel
+        cell.sort(key=lambda e: (e.score, novelty_against(e, cell, ngram_n=4)), reverse=True)
+
+        # obetnij do top-N
+        changed = len(cell) > self.per_cell
+        self.archive[elite.key] = cell[: self.per_cell]
+        return True or changed
 
     def _pick_parent(self) -> Optional[Elite]:
         if not self.archive:
             return None
-        return random.choice(list(self.archive.values()))
+        cell = random.choice(list(self.archive.values()))
+        return random.choice(cell)
 
     def run(self) -> Dict[EliteKey, Elite]:
         # 1) inicjalizacja archiwum losowo
@@ -178,38 +275,56 @@ class MapElites:
 
         return self.archive
 
-    def save_archive(self, out_dir: str) -> None:
+    def save_archive(self, out_dir: str, run_meta: Optional[dict] = None) -> None:
         os.makedirs(out_dir, exist_ok=True)
 
-        # sort elit po score malejąco, ogranicz ilość zapisu
-        elites_sorted = sorted(self.archive.values(), key=lambda e: e.score, reverse=True)
-        elites_sorted = elites_sorted[: self.cfg.max_elites_to_save]
+        # spłaszcz archiwum: (key, elite, k)
+        flat: List[tuple[EliteKey, Elite, int]] = []
+        for key, cell in self.archive.items():
+            for k, elite in enumerate(cell):
+                flat.append((key, elite, k))
+
+        # sortuj globalnie po score
+        flat.sort(key=lambda x: x[1].score, reverse=True)
+
+        # ogranicz liczbę zapisywanych elit
+        flat = flat[: self.cfg.max_elites_to_save]
 
         index = []
-        for e in elites_sorted:
-            a, t = e.key
-            fname = f"elite_a{a:02d}_t{t:02d}.json"
+
+        for key, elite, k in flat:
+            a, t, pc = key
+            fname = f"elite_a{a:02d}_t{t:02d}_pc{pc:02d}_k{k:02d}.json"
             path = os.path.join(out_dir, fname)
 
             sr = SearchResult(
-                melody=e.melody,
-                score=e.score,
+                melody=elite.melody,
+                score=elite.score,
                 passed=True,
                 reason="",
                 score_breakdown=(),
                 filter_trace=(),
                 meta={
-                    "descriptor": {"ambitus_bin": a, "turn_rate_bin": t},
+                    "descriptor": {
+                        "ambitus_bin": a,
+                        "turn_rate_bin": t,
+                        "pc_bin": pc,
+                        "cell_rank": k,
+                    },
                     "n_notes": self.cfg.n_notes,
+                    "run": run_meta or {},
                 },
             )
+
             save_result_json(path, sr)
 
             index.append({
                 "file": fname,
-                "score": e.score,
+                "score": elite.score,
                 "ambitus_bin": a,
                 "turn_rate_bin": t,
+                "pc_bin": pc,
+                "cell_rank": k,
                 "n_notes": self.cfg.n_notes,
             })
 

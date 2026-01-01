@@ -1,58 +1,71 @@
+# evaluation/evaluator.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Any
 
 from core.melody import Melody
 from core.stats import MelodyStats
-from .filters import Filter
-from .scorers import Scorer
+from core.io import SearchResult  # jeśli SearchResult jest gdzie indziej, popraw import
 
 
-@dataclass
-class EvaluationResult:
-    passed: bool
-    score: float
-    reason: str = ""
-    filter_trace: List[Tuple[str, bool, str]] = field(default_factory=list)
-    score_breakdown: List[Tuple[str, float]] = field(default_factory=list)
-    stats: MelodyStats | None = None
-
-
-@dataclass
 class MelodyEvaluator:
-    filters: List[Filter] = field(default_factory=list)
-    scorers: List[Scorer] = field(default_factory=list)
+    def __init__(self, filters, scorers):
+        self.filters = list(filters)
+        self.scorers = list(scorers)
 
-    def evaluate(self, melody: Melody) -> EvaluationResult:
+    def evaluate(self, melody: Melody) -> SearchResult:
         stats = MelodyStats.compute(melody)
 
-        trace: List[Tuple[str, bool, str]] = []
-        for f in self.filters:
-            ok, reason = f.check(melody, stats)
-            trace.append((f.name, ok, reason))
-            if not ok:
-                return EvaluationResult(
-                    passed=False,
+        filter_trace: List[Dict[str, Any]] = []
+        for flt in self.filters:
+            passed, reason = flt.check(melody, stats)
+            filter_trace.append({
+                "type": flt.__class__.__name__,
+                "passed": bool(passed),
+                "reason": str(reason) if reason else "",
+                "params": {k: v for k, v in flt.__dict__.items() if not k.startswith("_")},
+            })
+            if not passed:
+                return SearchResult(
+                    melody=melody,
                     score=float("-inf"),
-                    reason=f"{f.name}: {reason}",
-                    filter_trace=trace,
+                    passed=False,
+                    reason=str(reason) if reason else flt.__class__.__name__,
                     score_breakdown=[],
-                    stats=stats,
+                    filter_trace=filter_trace,
+                    meta={"stats": _stats_to_meta(stats)},
                 )
 
-        breakdown: List[Tuple[str, float]] = []
+        score_breakdown: List[Dict[str, Any]] = []
         total = 0.0
-        for s in self.scorers:
-            v = s.score(melody, stats)
-            breakdown.append((s.name, v))
-            total += v
+        for scr in self.scorers:
+            val = float(scr.score(melody, stats))
+            total += val
+            score_breakdown.append({
+                "type": scr.__class__.__name__,
+                "value": val,
+                "params": {k: v for k, v in scr.__dict__.items() if not k.startswith("_")},
+            })
 
-        return EvaluationResult(
-            passed=True,
+        return SearchResult(
+            melody=melody,
             score=total,
+            passed=True,
             reason="",
-            filter_trace=trace,
-            score_breakdown=breakdown,
-            stats=stats,
+            score_breakdown=score_breakdown,
+            filter_trace=filter_trace,
+            meta={"stats": _stats_to_meta(stats)},
         )
+
+
+def _stats_to_meta(stats: MelodyStats) -> dict:
+    # minimalnie użyteczne rzeczy do debugowania
+    return {
+        "n": stats.n,
+        "ambitus": stats.ambitus,
+        "turns": stats.turns,
+        "pitch_class_hist": list(getattr(stats, "pitch_class_hist", [])),
+        # jeśli stats.intervals istnieje:
+        "intervals_head": list(getattr(stats, "intervals", [])[:16]),
+    }
